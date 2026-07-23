@@ -1,0 +1,9 @@
+# Build artifacts
+*.log
+build/
+.pio/
+
+# Editor/OS cruft
+.vscode/
+.DS_Store
+Thumbs.db
