@@ -1,5 +1,5 @@
 /*
- * Controller / Receiver - consolidated draft (v3)
+ * Controller / Receiver - consolidated draft (v4)
  * -------------------------------------------------
  * Replaces the separate blinky_rx / esp_now_display_rx / esp_now_gps_rx
  * drafts with one sketch.
@@ -9,10 +9,10 @@
  *   Drone --filters RSSI, classifies NEAR/MID/FAR/LOST zone (same
  *           logic as esp_now_proximity_finder.ino's SEEKER role) -->
  *   Drone --proximity_report_t, ~10x/sec-->  Controller (this board)
- *   Controller drives tone/LED off the zone the drone relays. No RSSI
- *   math happens here - the drone is the one flying around the puck,
- *   so it has to be the one sensing proximity; the controller just
- *   plays the result back to the operator.
+ *   Controller drives buzzer/RGB LED off the zone the drone relays. No
+ *   RSSI math happens here - the drone is the one flying around the
+ *   puck, so it has to be the one sensing proximity; the controller
+ *   just plays the result back to the operator.
  *
  *   Drone --struct_message (GPS), ~1x/sec--> Controller, for the
  *   separate FOLLOW HOME feature (drone <-> its own first fix, no
@@ -24,9 +24,9 @@
  *     RSSI zone.
  *   - FOLLOW HOME button: track the way back to the captured home
  *     point.
- *   - Rotary encoder: dev/test override. Turning it feeds a manual
- *     distance into the tone/LED instead of live sensing; reverts to
- *     live data automatically 5s after you stop turning it.
+ *   - Potentiometer dial: dev/test override. Turning it feeds a
+ *     manual distance into the buzzer/LED instead of live sensing;
+ *     reverts to live data automatically 5s after you stop turning it.
  *
  * Screen content is still open (per team discussion) - updateDisplay()
  * below is a plain status readout, not a locked-in UI design. Treat it
@@ -60,11 +60,29 @@
  * All radios (controller, drone, puck) should lock to the same fixed
  * WiFi channel (see WIFI_CHANNEL below) for reliable reception.
  *
- * PIN CONFIG - CONFIRM AGAINST ACTUAL WIRING BEFORE FLASHING
+ * PIN CONFIG - confirmed against real controller wiring (2026-08-05).
  * ------------------------------------------------------------
- * I2C, encoder, and button pins below are copied from ui_test.ino,
- * since that's already been bench-tested against the real board.
- * LED_PIN and PIEZO_PIN are still unconfirmed placeholders.
+ * Matches hardwaretest.ino, which is flashed on this board and fully
+ * working: OLED on 22/23, buttons on 2/3, buzzer on 18, RGB LED
+ * (common cathode) on 19/20/21, potentiometer wiper on GPIO0. The
+ * earlier v3 draft's pins (I2C 6/7, buttons 4/5, rotary encoder
+ * 2/3/1) were copied from ui_test.ino's separate bench rig and did
+ * not match this board - replaced below.
+ *
+ * BUZZER - confirmed genuinely active (2026-08-05), not a passive
+ * piezo. An active buzzer has its own fixed-pitch oscillator and can
+ * only be switched on/off - it cannot be pitch-shifted by driving the
+ * pin at different frequencies. So zone/distance feedback below is
+ * conveyed by beep RATE (how fast it clicks) instead of pitch. Driven
+ * via LEDC PWM rather than a plain digitalWrite so BUZZER_VOLUME_PERCENT
+ * can turn the volume down (2026-08-05 - full HIGH/LOW drive was too loud).
+ *
+ * RGB LED (2026-08-06) - also PWM-driven now (not plain on/off), so
+ * color is a genuine continuous gradient instead of a handful of fixed
+ * hues: green = close, red = far, blending through yellow in between.
+ * off = lost/no signal. (Earlier draft had this backwards - red=close -
+ * flipped per team direction.) Still blinks in sync with the buzzer's
+ * on/off click.
  */
 
 #include <Wire.h>
@@ -75,38 +93,68 @@
 #include <esp_wifi.h>
 #include <math.h>
 
-// ---- Pin configuration ----
-#define I2C_SDA 6                    // matches ui_test.ino / esp_now_gps_rx.ino
-#define I2C_SCL 7                    // matches ui_test.ino / esp_now_gps_rx.ino
-#define LED_PIN 8                    // TODO confirm: tone-mirror LED (not yet bench-tested)
-#define PIEZO_PIN 10                 // TODO confirm: piezo speaker (not yet bench-tested)
-#define BUTTON_FOLLOW_PUCK_PIN 4     // matches ui_test.ino's BTN_CONFIRM
-#define BUTTON_FOLLOW_HOME_PIN 5     // matches ui_test.ino's BTN_CANCEL
-#define ENC_A 2                      // matches ui_test.ino's rotary encoder
-#define ENC_B 3                      // matches ui_test.ino's rotary encoder
-#define ENC_SW 1                     // matches ui_test.ino - optional, unused for now
+// ---- Pin configuration (matches hardwaretest.ino / real wiring) ----
+#define I2C_SDA 22                   // OLED SDA
+#define I2C_SCL 23                   // OLED SCL
+#define POT_PIN 0                    // potentiometer wiper - dev/test dial
+#define BUTTON_FOLLOW_PUCK_PIN 2     // = hardwaretest.ino's BUTTON1_PIN
+#define BUTTON_FOLLOW_HOME_PIN 3     // = hardwaretest.ino's BUTTON2_PIN
+#define BUZZER_PIN 18                // active buzzer - on/off only, no pitch control
+#define LED_R 19                     // RGB LED, common cathode
+#define LED_G 20
+#define LED_B 21
 
 // ---- OLED config (same as esp_now_gps_rx.ino / ui_test.ino) ----
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR 0x3C
 #define OLED_RESET -1
+// 0 = as-is, 2 = flipped 180 - set to whichever reads right-side up in
+// your enclosure (bench video 2026-08-05 showed text upside down at 0).
+#define DISPLAY_ROTATION 2
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---- Radio config - must match esp_now_gps_tx.ino / puck_gps_tx.ino ----
 #define WIFI_CHANNEL 1
 const uint8_t TX_POWER_QUARTER_DBM = 84; // 84 = 21 dBm (max) - keep identical on all radios
 
-// ---- FOLLOW HOME distance -> tone mapping. Tune once real-world distances are known ----
-const float DIST_MIN_M = 1.0f;     // at or below this: max frequency ("hot")
-const float DIST_MAX_M = 100.0f;   // at or above this: min frequency ("cold")
-const int FREQ_MIN_HZ = 200;
-const int FREQ_MAX_HZ = 1200;
+// ---- FOLLOW HOME distance -> beep-rate mapping. Tune once real-world
+// distances are known. Buzzer is on/off only (see note above), so
+// "getting warmer" is conveyed by faster clicking, not higher pitch. ----
+const float DIST_MIN_M = 1.0f;             // at or below this: fastest click ("hot")
+const float DIST_MAX_M = 100.0f;           // at or above this: slowest click ("cold")
+const uint16_t HOME_CLICK_ON_MS = 90;      // click length, constant across the range
+const uint16_t HOME_PERIOD_MIN_MS = 150;   // click period when close
+const uint16_t HOME_PERIOD_MAX_MS = 1000;  // click period when far
 
-// ---- Manual override (rotary encoder) config ----
+// ---- Buzzer volume, via PWM duty cycle (see header note - active buzzer,
+// full HIGH/LOW drive was reported too loud 2026-08-05). Lower duty =
+// lower average voltage = quieter, down to some point where a given
+// buzzer stops oscillating altogether - stay well above that floor. ----
+const int BUZZER_PWM_FREQ_HZ = 20000;      // carrier above hearing range - no PWM whine
+const int BUZZER_PWM_RESOLUTION_BITS = 8;  // 0-255 duty steps
+const uint8_t BUZZER_VOLUME_PERCENT = 65;  // tune this one knob if it needs to go up/down
+const uint8_t BUZZER_DUTY_ON = (uint8_t)(BUZZER_VOLUME_PERCENT * 255 / 100);
+
+// ---- RGB LED gradient config (2026-08-06). Color is continuous now, not
+// bucketed - FOLLOW HOME/dial reuse DIST_MIN_M/DIST_MAX_M directly as the
+// gradient's near/far ends. FOLLOW PUCK doesn't get a meters value from
+// the drone, so it mirrors the RSSI thresholds instead (cosmetic only -
+// not wire-protocol critical, but keep roughly in sync with
+// esp_now_gps_tx.ino's RSSI_NEAR/RSSI_FAR if those get retuned). ----
+const float RSSI_NEAR_MIRROR_DBM = -55.0f; // at/stronger than this: full green
+const float RSSI_FAR_MIRROR_DBM  = -82.0f; // at/weaker than this: full red
+
+// ---- Manual override (potentiometer) config ----
+const int POT_ADC_MIN = 0;
+const int POT_ADC_MAX = 4095;                // ESP32 12-bit ADC
+const int POT_MOVE_THRESHOLD = 25;           // ignore ADC jitter smaller than this
+const float POT_SMOOTHING_ALPHA = 0.25f;     // 0-1, lower = smoother. Without this, raw ADC
+                                              // noise fed straight into periodMs every loop and
+                                              // made the buzzer crackle instead of click cleanly
+                                              // while turning fast (seen in 2026-08-05 bench video)
 const float OVERRIDE_DIST_MIN_M = 0.0f;
 const float OVERRIDE_DIST_MAX_M = DIST_MAX_M;
-const float ENCODER_STEP_M = 0.5f;                   // meters per detent, matches ui_test.ino
 const unsigned long DIAL_OVERRIDE_TIMEOUT_MS = 5000; // revert to live sensing this long after last turn
 
 // ---- GPS freshness (drone only, for FOLLOW HOME) ----
@@ -147,19 +195,68 @@ typedef struct {
 enum PuckZone { ZONE_NEAR = 0, ZONE_MID = 1, ZONE_FAR = 2, ZONE_LOST = 3 };
 const char *zoneNames[] = { "NEAR", "MID", "FAR", "LOST" };
 
+// on/off click timing only - no freq field, since the buzzer can't be
+// pitch-shifted. Must still *feel* like the beep feel
+// esp_now_proximity_finder.ino uses (rapid when close, slow when far).
 struct BeepPattern {
-  uint16_t freq;      // tone frequency, Hz (0 = silent)
-  uint16_t onMs;       // how long the tone sounds within each cycle
-  uint16_t periodMs;   // full cycle length (on + off)
+  uint16_t onMs;       // how long the buzzer sounds within each cycle
+  uint16_t periodMs;   // full cycle length (on + off); 0 = silent
 };
-// Must match the beep feel esp_now_proximity_finder.ino uses, since the
-// drone classifies zones with those same thresholds.
 BeepPattern zonePatterns[4] = {
-  { 2400, 110, 150 },   // NEAR - rapid, high pitched, almost continuous
-  { 1500, 120, 400 },   // MID  - moderate beeping
-  { 900,  150, 1000 },  // FAR  - slow, low-pitched beeps
-  { 0,    0,   0 }      // LOST - silent
+  { 110, 150 },    // NEAR - rapid, almost continuous
+  { 120, 400 },    // MID  - moderate beeping
+  { 150, 1000 },   // FAR  - slow beeps
+  { 0,   0    }    // LOST - silent
 };
+
+// PWM intensities (0-255 per channel) now, not on/off bools - lets the
+// LED show a real blended color instead of one of 8 fixed hues.
+struct RgbColor { uint8_t r, g, b; };
+const RgbColor COLOR_OFF = { 0, 0, 0 };
+
+// All struct types live up here, before ANY function definition (even
+// ones like gradientColor() right below that don't use these two) - the
+// Arduino IDE hoists auto-generated prototypes for every function as one
+// block, inserted at the position of the FIRST function definition in the
+// file. Whatever that first function ends up being, every type used by
+// ANY function's signature has to already be defined above it, or you
+// get "does not name a type" (bit us twice now - 2026-08-05, 2026-08-06 -
+// each time a new function got added earlier in the file than the last
+// one). Keeping every struct in one block up front avoids this for good.
+struct AvState {
+  BeepPattern pattern;
+  RgbColor color;
+};
+
+struct DebouncedButton {
+  uint8_t pin;
+  bool lastReading;
+  bool stableState;
+  unsigned long lastChangeMs;
+  DebouncedButton(uint8_t p) : pin(p), lastReading(HIGH), stableState(HIGH), lastChangeMs(0) {}
+};
+
+// t=0 -> full green (close), t=1 -> full red (far), blending through
+// yellow at t=0.5. Caller is responsible for mapping their real-world
+// value (meters or RSSI) onto this normalized 0..1 range first.
+RgbColor gradientColor(float t) {
+  t = constrain(t, 0.0f, 1.0f);
+  uint8_t r, g;
+  if (t < 0.5f) {
+    r = (uint8_t)(t * 2.0f * 255.0f);
+    g = 255;
+  } else {
+    r = 255;
+    g = (uint8_t)((1.0f - t) * 2.0f * 255.0f);
+  }
+  return { r, g, 0 };
+}
+
+float rssiToGradientT(float rssiDbm) {
+  float clamped = constrain(rssiDbm, RSSI_FAR_MIRROR_DBM, RSSI_NEAR_MIRROR_DBM);
+  // near (less negative) -> t=0, far (more negative) -> t=1
+  return (RSSI_NEAR_MIRROR_DBM - clamped) / (RSSI_NEAR_MIRROR_DBM - RSSI_FAR_MIRROR_DBM);
+}
 
 float latestRssi = 0;
 int puckZone = ZONE_LOST;
@@ -171,14 +268,8 @@ unsigned long lastProximityReportMillis = 0;
 enum FollowMode { MODE_FOLLOW_PUCK, MODE_FOLLOW_HOME };
 FollowMode currentMode = MODE_FOLLOW_PUCK;
 
-// ---- Debounced buttons (plain momentary press) ----
-struct DebouncedButton {
-  uint8_t pin;
-  bool lastReading;
-  bool stableState;
-  unsigned long lastChangeMs;
-  DebouncedButton(uint8_t p) : pin(p), lastReading(HIGH), stableState(HIGH), lastChangeMs(0) {}
-};
+// ---- Debounced buttons (plain momentary press; struct itself is defined
+// up top with the other types - see note there) ----
 const unsigned long DEBOUNCE_MS = 40;
 
 DebouncedButton puckBtn(BUTTON_FOLLOW_PUCK_PIN);
@@ -200,39 +291,103 @@ bool checkPressed(DebouncedButton &btn) {
   return pressedEdge;
 }
 
-// ---- Rotary encoder (quadrature, polled every loop - matches ui_test.ino) ----
-volatile int8_t encDelta = 0;
-uint8_t lastEncState = 0;
-const int8_t QUAD_TABLE[16] = {
-   0, -1,  1,  0,
-   1,  0,  0, -1,
-  -1,  0,  0,  1,
-   0,  1, -1,  0
-};
-
-void pollEncoder() {
-  uint8_t a = digitalRead(ENC_A);
-  uint8_t b = digitalRead(ENC_B);
-  uint8_t state = (a << 1) | b;
-  uint8_t idx = (lastEncState << 2) | state;
-  encDelta += QUAD_TABLE[idx & 0x0F];
-  lastEncState = state;
-}
-
+// ---- Manual override (potentiometer, absolute reading - no encoder on
+// this board). Turning the dial is detected as "reading moved more than
+// jitter allows"; the override then tracks the dial's absolute position
+// live, and hands control back to live sensing 5s after it stops moving. ----
 bool dialOverrideActive = false;
 unsigned long lastDialMoveMs = 0;
-float overrideDistanceM = 15.0f; // matches ui_test.ino's default approxDistanceM
+float overrideDistanceM = 15.0f;
+int lastPotReading = -1;
+float smoothedPot = -1.0f;
+
+// Real potentiometers/wiring rarely hit the full theoretical 0-4095 ADC
+// swing POT_ADC_MIN/MAX assume - mapping against a range the pot can't
+// actually reach compresses the usable output down to a fraction of
+// OVERRIDE_DIST_MAX_M (this is why it only felt like ~1-2m of travel).
+// So instead of trusting POT_ADC_MIN/MAX, track the widest raw range
+// actually seen and map against that - a couple of full turns end-to-end
+// after boot and it self-calibrates to whatever this pot really does.
+int potObservedMin = POT_ADC_MAX;
+int potObservedMax = POT_ADC_MIN;
+
+unsigned long lastDialDebugMs = 0;
+const unsigned long DIAL_DEBUG_INTERVAL_MS = 500; // Serial visibility while calibrating
+
+// Median-of-N glitch filter, applied before anything else touches the
+// reading. Bench test (2026-08-05) showed both physical end-stops read
+// cleanly but the middle of the travel would suddenly jump to an
+// unrelated value (e.g. 14m -> 35m -> 41m -> 14m while turning one way)
+// - classic symptom of a worn/dirty spot on the pot's resistive track.
+// A median rejects a single bad sample outright instead of just
+// dampening it like the EMA below does; the EMA still runs after this
+// for general smoothness. If glitches persist even with this in place,
+// it's likely a real dead spot on the track - try working the dial back
+// and forth across its full range repeatedly (can wipe a dirty contact
+// clean), or swap the pot if it keeps happening.
+const int POT_MEDIAN_WINDOW = 5; // odd, so there's always a clean middle value
+int potHistory[POT_MEDIAN_WINDOW];
+int potHistoryCount = 0;
+int potHistoryIdx = 0;
+
+int medianOfPotHistory() {
+  int sorted[POT_MEDIAN_WINDOW];
+  int n = potHistoryCount;
+  memcpy(sorted, potHistory, n * sizeof(int));
+  for (int i = 1; i < n; i++) {
+    int key = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      j--;
+    }
+    sorted[j + 1] = key;
+  }
+  return sorted[n / 2];
+}
+
+float floatMap(float x, float inMin, float inMax, float outMin, float outMax) {
+  return (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+}
 
 void updateManualOverride() {
-  if (encDelta != 0) {
-    overrideDistanceM = constrain(overrideDistanceM + encDelta * ENCODER_STEP_M,
-                                   OVERRIDE_DIST_MIN_M, OVERRIDE_DIST_MAX_M);
-    encDelta = 0;
+  int rawPot = analogRead(POT_PIN);
+  potHistory[potHistoryIdx] = rawPot;
+  potHistoryIdx = (potHistoryIdx + 1) % POT_MEDIAN_WINDOW;
+  if (potHistoryCount < POT_MEDIAN_WINDOW) potHistoryCount++;
+  int pot = medianOfPotHistory(); // de-glitched reading - use this below, not rawPot
+
+  if (lastPotReading < 0) lastPotReading = pot;   // first read - nothing to compare yet
+  if (smoothedPot < 0) smoothedPot = pot;         // seed the filter
+
+  // Movement detection uses the de-glitched (median) reading too now, so a
+  // single bad sample can't falsely trigger/extend the override.
+  if (abs(pot - lastPotReading) > POT_MOVE_THRESHOLD) {
     dialOverrideActive = true;
     lastDialMoveMs = millis();
   }
-  if (dialOverrideActive && millis() - lastDialMoveMs > DIAL_OVERRIDE_TIMEOUT_MS) {
-    dialOverrideActive = false; // untouched long enough - hand control back to live sensing
+  lastPotReading = pot;
+
+  if (pot < potObservedMin) potObservedMin = pot;
+  if (pot > potObservedMax) potObservedMax = pot;
+
+  // But the value that actually drives periodMs is smoothed - see
+  // POT_SMOOTHING_ALPHA above for why.
+  smoothedPot = POT_SMOOTHING_ALPHA * pot + (1.0f - POT_SMOOTHING_ALPHA) * smoothedPot;
+
+  if (dialOverrideActive) {
+    int rangeMax = max(potObservedMax, potObservedMin + 1); // guard div-by-zero pre-calibration
+    overrideDistanceM = floatMap(smoothedPot, potObservedMin, rangeMax,
+                                  OVERRIDE_DIST_MIN_M, OVERRIDE_DIST_MAX_M);
+    if (millis() - lastDialMoveMs > DIAL_OVERRIDE_TIMEOUT_MS) {
+      dialOverrideActive = false; // untouched long enough - hand control back to live sensing
+    }
+
+    if (millis() - lastDialDebugMs >= DIAL_DEBUG_INTERVAL_MS) {
+      lastDialDebugMs = millis();
+      Serial.printf("DIAL raw=%d  med=%d  observed=[%d,%d]  dist=%.1fm\n",
+                     rawPot, pot, potObservedMin, potObservedMax, overrideDistanceM);
+    }
   }
 }
 
@@ -250,29 +405,32 @@ double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
   return R * c;
 }
 
-float floatMap(float x, float inMin, float inMax, float outMin, float outMax) {
-  return (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
-}
-
-int distanceToFreqHz(float distM) {
+uint16_t distanceToPeriodMs(float distM) {
   float clamped = constrain(distM, DIST_MIN_M, DIST_MAX_M);
-  return (int)floatMap(clamped, DIST_MIN_M, DIST_MAX_M, FREQ_MAX_HZ, FREQ_MIN_HZ);
+  return (uint16_t)floatMap(clamped, DIST_MIN_M, DIST_MAX_M, HOME_PERIOD_MIN_MS, HOME_PERIOD_MAX_MS);
 }
 
-// For the OLED - not authoritative for audio (see currentTargetFreqHz)
+RgbColor homeDistanceColor(float distM) {
+  float clamped = constrain(distM, DIST_MIN_M, DIST_MAX_M);
+  float t = (clamped - DIST_MIN_M) / (DIST_MAX_M - DIST_MIN_M); // 0=close/green, 1=far/red
+  return gradientColor(t);
+}
+
+// For the OLED - not authoritative for audio (see currentAvState)
 bool activeDistanceValid = false;
 float activeDistanceM = 0.0f;
 
-// Single source of truth for "what frequency should be playing right now."
-// Every mode (RSSI relay, home, manual override) funnels through here so
-// updateToneAndLed() only ever has to deal with one number.
-int currentTargetFreqHz() {
+// Single source of truth for "what should the buzzer/LED be doing right
+// now." Every mode (RSSI relay, home, manual override) funnels through
+// here so updateBuzzerAndLed() only ever has to deal with one state.
+AvState currentAvState() {
   unsigned long now = millis();
 
   if (dialOverrideActive) {
     activeDistanceValid = true;
     activeDistanceM = overrideDistanceM;
-    return distanceToFreqHz(overrideDistanceM);
+    BeepPattern p = { HOME_CLICK_ON_MS, distanceToPeriodMs(overrideDistanceM) };
+    return { p, homeDistanceColor(overrideDistanceM) };
   }
 
   if (currentMode == MODE_FOLLOW_HOME) {
@@ -280,45 +438,42 @@ int currentTargetFreqHz() {
     if (droneFresh && homeSet) {
       activeDistanceM = (float)haversineMeters(droneMsg.lat, droneMsg.lon, homeLat, homeLon);
       activeDistanceValid = true;
-      return distanceToFreqHz(activeDistanceM);
+      BeepPattern p = { HOME_CLICK_ON_MS, distanceToPeriodMs(activeDistanceM) };
+      return { p, homeDistanceColor(activeDistanceM) };
     }
     activeDistanceValid = false;
-    return 0;
+    return { { 0, 0 }, COLOR_OFF };
   }
 
-  // MODE_FOLLOW_PUCK - driven entirely by the drone's relayed RSSI zone.
-  // No meters value here, so drive the same zone-based beep pattern
-  // esp_now_proximity_finder.ino uses, gated on/off by phase.
+  // MODE_FOLLOW_PUCK - driven by the drone's relayed RSSI zone (beep rate,
+  // still discrete/bucketed - fine, it doesn't need to be continuous) and
+  // the raw relayed RSSI value (LED color - continuous gradient).
   activeDistanceValid = false;
   bool reportFresh = (now - lastProximityReportMillis) <= PROXIMITY_REPORT_TIMEOUT_MS;
   int effectiveZone = reportFresh ? puckZone : ZONE_LOST;
-
-  BeepPattern p = zonePatterns[effectiveZone];
-  if (p.periodMs == 0) return 0; // ZONE_LOST
-  uint32_t phase = now % p.periodMs;
-  return (phase < p.onMs) ? p.freq : 0;
+  RgbColor puckColor = (effectiveZone == ZONE_LOST) ? COLOR_OFF
+                                                     : gradientColor(rssiToGradientT(latestRssi));
+  return { zonePatterns[effectiveZone], puckColor };
 }
 
 // =====================================================================
-// Tone + LED, driven from one shared square wave so the LED is a
-// literal mirror of the piezo's on/off cycle. Non-blocking.
+// Buzzer + RGB LED, driven from one shared on/off cycle so the LED is
+// a color-coded mirror of the buzzer's click. Non-blocking.
 // =====================================================================
-bool waveState = false;
-unsigned long lastToggleMicros = 0;
+void setLed(const RgbColor &c) {
+  ledcWrite(LED_R, c.r);
+  ledcWrite(LED_G, c.g);
+  ledcWrite(LED_B, c.b);
+}
 
-void updateToneAndLed(int freqHz) {
-  if (freqHz <= 0) {
-    digitalWrite(PIEZO_PIN, LOW);
-    digitalWrite(LED_PIN, LOW);
-    return;
+void updateBuzzerAndLed(const AvState &state) {
+  bool on = false;
+  if (state.pattern.periodMs > 0) {
+    uint32_t phase = millis() % state.pattern.periodMs;
+    on = phase < state.pattern.onMs;
   }
-  unsigned long halfPeriodUs = 500000UL / (unsigned long)freqHz;
-  if (micros() - lastToggleMicros >= halfPeriodUs) {
-    lastToggleMicros = micros();
-    waveState = !waveState;
-    digitalWrite(PIEZO_PIN, waveState ? HIGH : LOW);
-    digitalWrite(LED_PIN, waveState ? HIGH : LOW);
-  }
+  ledcWrite(BUZZER_PIN, on ? BUZZER_DUTY_ON : 0);
+  setLed(on ? state.color : COLOR_OFF);
 }
 
 // =====================================================================
@@ -394,24 +549,24 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(PIEZO_PIN, OUTPUT);
+  // LEDC PWM (not plain digitalWrite) for the LED channels and buzzer -
+  // needed for the color gradient and the volume knob, see notes above.
+  ledcAttach(LED_R, 5000, 8);
+  ledcAttach(LED_G, 5000, 8);
+  ledcAttach(LED_B, 5000, 8);
+  ledcAttach(BUZZER_PIN, BUZZER_PWM_FREQ_HZ, BUZZER_PWM_RESOLUTION_BITS);
   pinMode(BUTTON_FOLLOW_PUCK_PIN, INPUT_PULLUP);
   pinMode(BUTTON_FOLLOW_HOME_PIN, INPUT_PULLUP);
-  pinMode(ENC_A, INPUT_PULLUP);
-  pinMode(ENC_B, INPUT_PULLUP);
-  pinMode(ENC_SW, INPUT_PULLUP);
 
-  digitalWrite(LED_PIN, LOW);
-  digitalWrite(PIEZO_PIN, LOW);
-
-  lastEncState = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+  setLed(COLOR_OFF);
+  ledcWrite(BUZZER_PIN, 0);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!display.begin(OLED_ADDR, true)) {
     Serial.println("Display not found!");
     while (1);
   }
+  display.setRotation(DISPLAY_ROTATION);
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
@@ -438,15 +593,13 @@ void setup() {
 }
 
 void loop() {
-  pollEncoder();
-
   if (checkPressed(puckBtn)) currentMode = MODE_FOLLOW_PUCK;
   if (checkPressed(homeBtn)) currentMode = MODE_FOLLOW_HOME;
 
   updateManualOverride();
 
-  int freqHz = currentTargetFreqHz();
-  updateToneAndLed(freqHz);
+  AvState state = currentAvState();
+  updateBuzzerAndLed(state);
 
   updateDisplay();
 }
