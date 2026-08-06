@@ -19,14 +19,19 @@
  *   controller GPS). Puck no longer sends GPS - drone<->puck finding
  *   is RSSI-only.
  *
- * Controls:
- *   - FOLLOW PUCK button: track the puck via the drone's relayed
- *     RSSI zone.
- *   - FOLLOW HOME button: track the way back to the captured home
- *     point.
- *   - Potentiometer dial: dev/test override. Turning it feeds a
- *     manual distance into the buzzer/LED instead of live sensing;
- *     reverts to live data automatically 5s after you stop turning it.
+ * Controls (2026-08-06 - button roles changed from earlier drafts):
+ *   - Button 1 (MODE): toggles between FOLLOW PUCK and FOLLOW HOME each
+ *     press - no longer two separate "set to X" buttons.
+ *   - Button 2 (POT TOGGLE): enables/disables the potentiometer dial
+ *     override entirely. Added because the dial's known worn-track
+ *     jumpiness (see notes further down) could occasionally trip
+ *     dialOverrideActive on its own and never let go of live sensing -
+ *     this gives a hard way to shut the dial out of the loop while
+ *     testing the real puck/drone system.
+ *   - Potentiometer dial (only listened to while pot override is
+ *     enabled): dev/test override. Turning it feeds a manual distance
+ *     into the buzzer/LED instead of live sensing; reverts to live data
+ *     automatically 5s after you stop turning it.
  *
  * Screen content is still open (per team discussion) - updateDisplay()
  * below is a plain status readout, not a locked-in UI design. Treat it
@@ -97,8 +102,8 @@
 #define I2C_SDA 22                   // OLED SDA
 #define I2C_SCL 23                   // OLED SCL
 #define POT_PIN 0                    // potentiometer wiper - dev/test dial
-#define BUTTON_FOLLOW_PUCK_PIN 2     // = hardwaretest.ino's BUTTON1_PIN
-#define BUTTON_FOLLOW_HOME_PIN 3     // = hardwaretest.ino's BUTTON2_PIN
+#define BUTTON_MODE_PIN 2            // = hardwaretest.ino's BUTTON1_PIN - toggles FOLLOW PUCK/HOME
+#define BUTTON_POT_TOGGLE_PIN 3      // = hardwaretest.ino's BUTTON2_PIN - enables/disables the dial
 #define BUZZER_PIN 18                // active buzzer - on/off only, no pitch control
 #define LED_R 19                     // RGB LED, common cathode
 #define LED_G 20
@@ -272,8 +277,8 @@ FollowMode currentMode = MODE_FOLLOW_PUCK;
 // up top with the other types - see note there) ----
 const unsigned long DEBOUNCE_MS = 40;
 
-DebouncedButton puckBtn(BUTTON_FOLLOW_PUCK_PIN);
-DebouncedButton homeBtn(BUTTON_FOLLOW_HOME_PIN);
+DebouncedButton modeBtn(BUTTON_MODE_PIN);
+DebouncedButton potToggleBtn(BUTTON_POT_TOGGLE_PIN);
 
 // Returns true exactly once, on the press edge (HIGH -> LOW, since INPUT_PULLUP)
 bool checkPressed(DebouncedButton &btn) {
@@ -294,7 +299,11 @@ bool checkPressed(DebouncedButton &btn) {
 // ---- Manual override (potentiometer, absolute reading - no encoder on
 // this board). Turning the dial is detected as "reading moved more than
 // jitter allows"; the override then tracks the dial's absolute position
-// live, and hands control back to live sensing 5s after it stops moving. ----
+// live, and hands control back to live sensing 5s after it stops moving.
+// Button 2 (BUTTON_POT_TOGGLE_PIN) can shut this whole thing off - see
+// potOverrideEnabled below - since the pot's worn track (further down)
+// could occasionally fake a "touch" and hijack control on its own. ----
+bool potOverrideEnabled = true; // toggled by Button 2 - see loop()
 bool dialOverrideActive = false;
 unsigned long lastDialMoveMs = 0;
 float overrideDistanceM = 15.0f;
@@ -351,6 +360,11 @@ float floatMap(float x, float inMin, float inMax, float outMin, float outMax) {
 }
 
 void updateManualOverride() {
+  if (!potOverrideEnabled) {
+    dialOverrideActive = false; // force live sensing while the dial is switched off
+    return;                     // don't even read the pot - keeps it fully out of the loop
+  }
+
   int rawPot = analogRead(POT_PIN);
   potHistory[potHistoryIdx] = rawPot;
   potHistoryIdx = (potHistoryIdx + 1) % POT_MEDIAN_WINDOW;
@@ -477,37 +491,98 @@ void updateBuzzerAndLed(const AvState &state) {
 }
 
 // =====================================================================
-// OLED (rate-limited so I2C traffic doesn't eat the loop). Placeholder
-// content - swap out once the team settles on an actual screen design.
+// OLED (rate-limited so I2C traffic doesn't eat the loop). Layout
+// borrowed from ui_test.ino's "SET PUCK" mockup (header bar, big
+// readout, crosshair icon, small label, footer bar) per team request
+// 2026-08-06, split into two screens: DEV MODE while the dial is
+// actively being worked (dialOverrideActive), PLAY MODE otherwise -
+// live sensing. DEV MODE can only happen while the pot is enabled (see
+// potOverrideEnabled - updateManualOverride() can't set
+// dialOverrideActive while it's off), so only PLAY MODE's header needs
+// to flag a disabled pot.
+//
+// Dropped the raw RSSI dBm readout the old screen had, to match
+// ui_test's cleaner look - easy to add back (e.g. into DEV MODE, or a
+// long-press reveal) if it turns out to be missed for threshold tuning.
 // =====================================================================
 unsigned long lastDisplayUpdateMs = 0;
 const unsigned long DISPLAY_INTERVAL_MS = 150;
+
+void drawHeader(const char *label) {
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(0, 0);
+  display.print(label);
+  display.drawFastHLine(0, 10, SCREEN_WIDTH, SH110X_WHITE);
+}
+
+void drawCrosshair(int cx, int cy) {
+  display.drawCircle(cx, cy, 12, SH110X_WHITE);
+  display.drawCircle(cx, cy, 2, SH110X_WHITE);
+}
+
+void drawFooter() {
+  display.drawFastHLine(0, 54, SCREEN_WIDTH, SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 57);
+  display.print("1:MODE  2:POT");
+}
+
+void drawDevModeScreen() {
+  drawHeader("DEV MODE");
+
+  display.setTextSize(2);
+  display.setCursor(4, 20);
+  display.print("~");
+  display.print(overrideDistanceM, 1);
+  display.print(" m");
+
+  drawCrosshair(108, 32);
+
+  display.setTextSize(1);
+  display.setCursor(0, 44);
+  display.print("SOURCE: MANUAL DIAL");
+
+  drawFooter();
+}
+
+void drawPlayModeScreen() {
+  drawHeader(potOverrideEnabled ? "PLAY MODE" : "PLAY MODE (POT OFF)");
+
+  display.setTextSize(2);
+  display.setCursor(4, 20);
+  if (currentMode == MODE_FOLLOW_HOME) {
+    if (activeDistanceValid) {
+      display.print("~");
+      display.print(activeDistanceM, 1);
+      display.print(" m");
+    } else {
+      display.print("NO FIX");
+    }
+  } else {
+    bool reportFresh = (millis() - lastProximityReportMillis) <= PROXIMITY_REPORT_TIMEOUT_MS;
+    display.print(zoneNames[reportFresh ? puckZone : ZONE_LOST]);
+  }
+
+  drawCrosshair(108, 32);
+
+  display.setTextSize(1);
+  display.setCursor(0, 44);
+  display.print(currentMode == MODE_FOLLOW_PUCK ? "FOLLOW PUCK" : "FOLLOW HOME");
+
+  drawFooter();
+}
 
 void updateDisplay() {
   if (millis() - lastDisplayUpdateMs < DISPLAY_INTERVAL_MS) return;
   lastDisplayUpdateMs = millis();
 
   display.clearDisplay();
-  display.setTextColor(SH110X_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-
-  display.println(currentMode == MODE_FOLLOW_PUCK ? "MODE: FOLLOW PUCK" : "MODE: FOLLOW HOME");
-
   if (dialOverrideActive) {
-    display.println("SOURCE: MANUAL DIAL");
-    display.printf("Dist: %.1f m\n", overrideDistanceM);
-  } else if (currentMode == MODE_FOLLOW_HOME) {
-    display.print("Drone: "); display.println(droneMsg.fixValid ? "fix" : "no fix");
-    if (activeDistanceValid) display.printf("Dist: %.1f m\n", activeDistanceM);
-    else display.println("Dist: -- (waiting)");
+    drawDevModeScreen();
   } else {
-    bool reportFresh = (millis() - lastProximityReportMillis) <= PROXIMITY_REPORT_TIMEOUT_MS;
-    display.printf("Zone: %s\n", zoneNames[reportFresh ? puckZone : ZONE_LOST]);
-    display.printf("RSSI: %.1f dBm\n", latestRssi);
-    if (!reportFresh) display.println("(no relay from drone)");
+    drawPlayModeScreen();
   }
-
   display.display();
 }
 
@@ -555,8 +630,8 @@ void setup() {
   ledcAttach(LED_G, 5000, 8);
   ledcAttach(LED_B, 5000, 8);
   ledcAttach(BUZZER_PIN, BUZZER_PWM_FREQ_HZ, BUZZER_PWM_RESOLUTION_BITS);
-  pinMode(BUTTON_FOLLOW_PUCK_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_FOLLOW_HOME_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_MODE_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_POT_TOGGLE_PIN, INPUT_PULLUP);
 
   setLed(COLOR_OFF);
   ledcWrite(BUZZER_PIN, 0);
@@ -593,8 +668,13 @@ void setup() {
 }
 
 void loop() {
-  if (checkPressed(puckBtn)) currentMode = MODE_FOLLOW_PUCK;
-  if (checkPressed(homeBtn)) currentMode = MODE_FOLLOW_HOME;
+  if (checkPressed(modeBtn)) {
+    currentMode = (currentMode == MODE_FOLLOW_PUCK) ? MODE_FOLLOW_HOME : MODE_FOLLOW_PUCK;
+  }
+  if (checkPressed(potToggleBtn)) {
+    potOverrideEnabled = !potOverrideEnabled;
+    Serial.printf("Pot override %s\n", potOverrideEnabled ? "ENABLED" : "DISABLED");
+  }
 
   updateManualOverride();
 
