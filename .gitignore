@@ -7,3 +7,10 @@ build/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Coursework source material. Kept alongside the project because it is where
+# the system description, the design rationale and the hardware list were
+# written down, but not published: the documentation here is written from it
+# rather than shipping it.
+/reference/
+/capstone reference material/
