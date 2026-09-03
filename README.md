@@ -4,11 +4,7 @@ Hide and seek played with an FPV drone. A puck is hidden somewhere in the play
 area; the pilot flies out to find it, and a handheld controller gets warmer or
 colder as the drone closes in.
 
-<!--
-  PHOTOS GO HERE. Drop them in docs/ and reference them, e.g.
-  ![The puck, drone and controller](docs/hardware.jpg)
-  A hardware project with no picture of the hardware is hard to read.
--->
+![The controller and the puck. The controller is a printed hinged case with an OLED reading "DEV MODE", a lit red LED, two buttons and a dial; the puck is a black printed disc.](docs/controller-and-puck.jpg)
 
 ## How the game works
 
@@ -33,15 +29,16 @@ pilot's distance to the puck, which nobody needs to know.
 ## Finding by signal strength, not GPS
 
 The original design had the puck and the drone both report GPS positions and the
-controller work out the distance between them. That was abandoned. Consumer GPS
-is accurate to several metres at best, which is the same order as the entire
-search — a fix that says "within five metres" cannot tell you whether you are on
-top of the puck or have flown past it. Signal strength is noisy but it is
-monotonic, and monotonic is what a hot-and-cold game needs.
+controller work out the distance between them. It was abandoned because the
+M10Q module could not hold a fix indoors, and the system had to work indoors and
+out. Signal strength needs no satellites, and while it is noisy it is monotonic
+— which is all a hot-and-cold game actually requires.
 
 GPS survives in one place: **follow home**, where the drone measures against its
-own launch point rather than against the puck. That is a genuinely large
-distance, which is exactly where GPS is good.
+own launch point rather than against the puck. That distance is large enough for
+GPS to be good at it, and it is an outdoor feature anyway.
+
+![The inside of the puck: a printed disc with an ESP32-C3 board screwed to it, sitting on a page of wiring notes.](docs/puck-internals.jpg)
 
 ## Feedback
 
@@ -84,10 +81,17 @@ wrong and the history is clearer with it left alone.
 |---|---|
 | Controller | ESP32-C6 Pico |
 | Drone | ESP32-C3 |
-| Puck | ESP32-S3 Zero |
+| Puck | ESP32-C3 |
 
-Plus an SH1106 OLED, an active buzzer, a common-cathode RGB LED, two buttons, a
-potentiometer, and a GPS module tapped for its serial output.
+| Peripheral | Notes |
+|---|---|
+| SH1106 OLED | I2C, driven through Adafruit GFX and SH110X |
+| M10Q GPS module | UART, parsed with TinyGPS++ |
+| Active piezo buzzer | Fixed pitch, so feedback is by rate |
+| Common-cathode RGB LED | PWM, continuous green-to-red gradient |
+| Momentary pushbuttons | Mode, and the dial override |
+| Potentiometer | Bench override for manual distance |
+| 18650 cell + TP4056 | Power and USB-C charging |
 
 Controller wiring, confirmed against the built unit:
 
@@ -116,6 +120,8 @@ All three boards must be locked to the same WiFi channel — see `WIFI_CHANNEL`
 in each sketch. Signal strength readings are only comparable within a channel,
 and the link is only reliable when the radios agree.
 
+![A drone frame being soldered by hand, motors and wiring visible.](docs/drone-assembly.jpg)
+
 ## Enclosures
 
 `models/` holds FreeCAD sources for the puck and controller housings. There are
@@ -134,6 +140,17 @@ not a designed interface. The "set puck" screen concept in
 
 The **potentiometer has a worn track** and can jump on its own. That is why
 there is a button to shut the dial out of the loop entirely.
+
+## Where it was going
+
+Three directions were planned and not built. **More game modes** — capture the
+flag, push the cart — on the same telemetry and RSSI foundation, since the game
+logic is centralised on the controller and adding a mode needs no drone firmware
+change. **A drone-agnostic mount**, built around the 1S/18650 power system that
+consumer micro-drones already use, so the electronics could be added to an
+existing drone rather than demanding a custom build. And the commercial side.
+
+![Early bench work: an OLED, an encoder and a bare ESP32 board on a desk beside a notebook sketch of the controller.](docs/bench-design.jpg)
 
 ## Credits
 
