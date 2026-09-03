@@ -1,2 +1,1 @@
-![Controller](controller_Page__.svg)
-![Puck](puck_Page__.svg)
+![Controller](controller_Page__.svg) ![Puck](puck_Page__.svg)
